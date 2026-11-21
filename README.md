@@ -37,12 +37,12 @@ Custom Buildkit connection to patch local or private images is only available wi
 By default, Copa Action creates its own Buildx instance to connect to for patching public and private images.
 
 ### Option 2: Connect using defaults through a custom socket
-To patch local images, `copa` is limited to using `docker`'s built-in buildkit service, and must use the [`containerd image store`](https://docs.docker.com/storage/containerd/) feature. To enable this in your Github workflow, use `ghaction-setup-docker`'s [daemon-configuration](https://github.com/crazy-max/ghaction-setup-docker#daemon-configuration) to set `"containerd-snapshotter": true`.
+To patch local images, `copa` is limited to using `docker`'s built-in buildkit service, and must use the [`containerd image store`](https://docs.docker.com/storage/containerd/) feature. To enable this in your Github workflow, use `setup-docker-action`'s [daemon-configuration](https://github.com/docker/setup-docker-action#daemon-configuration) to set `"containerd-snapshotter": true`.
 
 Example:
 ``` yaml
     - name: Set up Docker
-        uses: crazy-max/ghaction-setup-docker@v3
+        uses: docker/setup-docker-action@v5
         with:
         daemon-config: |
             {

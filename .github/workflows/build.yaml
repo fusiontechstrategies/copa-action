@@ -1,7 +1,7 @@
 name: "build"
 on: [push, pull_request]
 env:
-  TRIVY_VERSION: 0.48.3
+  TRIVY_VERSION: 0.69.3
   BUILDKIT_VERSION: 0.12.4
   BATS_VERSION: 1.10.0
 permissions: read-all
@@ -27,13 +27,15 @@ jobs:
           tar -zxvf trivy.tar.gz
           cp trivy /usr/local/bin/
 
-      - name: Generate trivy vuln report for opa image
+      - name: Generate trivy vuln report for debian image
         run: |
-          trivy image --vuln-type os --ignore-unfixed -f json -o /tmp/opa.0.46.0.json docker.io/openpolicyagent/opa:0.46.0
+          trivy image --pkg-types os --ignore-unfixed -f json -o /tmp/debian.12.1-slim.json docker.io/library/debian:12.1-slim
 
       - name: Get latest copa version
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          latest_tag=$(curl --retry 5 -s "https://api.github.com/repos/project-copacetic/copacetic/releases/latest" | jq -r '.tag_name')
+          latest_tag=$(gh api repos/project-copacetic/copacetic/releases/latest --jq '.tag_name')
           version=${latest_tag:1}
           echo "Copa version: $version"
           echo "COPA_VERSION=$version" >> $GITHUB_ENV
@@ -51,7 +53,7 @@ jobs:
 
       - name: Set up Docker
         if: matrix.test-type == 'custom-socket'
-        uses: crazy-max/ghaction-setup-docker@v3
+        uses: docker/setup-docker-action@3f1ab1ab0e29231562e4db4ca600c1a49653bac6 # v5.7.0
         with:
           daemon-config: |
             {
@@ -80,9 +82,9 @@ jobs:
             --mount=type=bind,source="$SOCKET",target=/var/run/docker.sock \
             --mount=type=bind,source=$GITHUB_OUTPUT,target=$GITHUB_OUTPUT -e GITHUB_OUTPUT \
             --name=copa-action \
-            copa-action 'docker.io/openpolicyagent/opa:0.46.0' 'opa.0.46.0.json' '0.46.0-patched' '10m' "${{ matrix.test-type }}" 'openvex' 'output.json' '5'
+            copa-action 'docker.io/library/debian:12.1-slim' 'debian.12.1-slim.json' '12.1-slim-patched' '10m' "${{ matrix.test-type }}" 'openvex' 'output.json' '5'
           
           # saving patched image to give trivy access when using a custom socket
-          docker -c "$CONTEXT" save -o patched.tar openpolicyagent/opa:0.46.0-patched
+          docker -c "$CONTEXT" save -o patched.tar debian:12.1-slim-patched
             
           bats --print-output-on-failure ./test/test.bats
