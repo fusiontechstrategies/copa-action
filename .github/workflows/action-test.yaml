@@ -13,11 +13,14 @@ permissions:
   contents: read
 jobs:
   single-platform:
-    name: single-platform (output ${{ matrix.output || 'unset' }})
+    name: single-platform (copa ${{ matrix.copa-version || 'latest' }}, output ${{ matrix.output || 'unset' }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
+        # the action runs its own entrypoint.sh in the copa-action image published for
+        # each copa release, so check that it still works with old images
+        copa-version: ["0.6.2", "0.10.0", ""]
         output: ["", "vex.json"]
     steps:
       - name: Check out code
@@ -43,6 +46,7 @@ jobs:
           patched-tag: patched
           output: ${{ matrix.output }}
           max_retries: 2
+          copa-version: ${{ matrix.copa-version }}
 
       - name: Check the patched image
         env:
@@ -62,3 +66,38 @@ jobs:
           after=$(jq '[.Results[]? | .Vulnerabilities[]?] | length' patched.json)
           echo "fixable vulnerabilities after patching: ${after}"
           test "$after" -eq 0
+
+  # a full image reference in patched-tag names the patched image
+  full-reference-tag:
+    name: single-platform (full reference in patched-tag)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Trivy
+        run: |
+          curl --retry 5 -fsSL -o trivy.tar.gz "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+          tar -zxf trivy.tar.gz trivy
+          sudo mv trivy /usr/local/bin/
+          rm trivy.tar.gz
+
+      - name: Generate Trivy report
+        run: |
+          trivy image --image-src remote --pkg-types os --ignore-unfixed --scanners vuln -f json -o report.json "$TEST_IMAGE"
+
+      - name: Run Copa action
+        id: copa
+        uses: ./
+        with:
+          image: ${{ env.TEST_IMAGE }}
+          image-report: report.json
+          patched-tag: localhost:5000/copa/alpine:3.18.4-patched
+
+      - name: Check the patched image
+        env:
+          PATCHED_IMAGE: ${{ steps.copa.outputs.patched-image }}
+        run: |
+          echo "patched-image: ${PATCHED_IMAGE}"
+          test "$PATCHED_IMAGE" = "localhost:5000/copa/alpine:3.18.4-patched"
+          docker image inspect "$PATCHED_IMAGE" > /dev/null

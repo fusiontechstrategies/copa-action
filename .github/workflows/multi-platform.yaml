@@ -1,0 +1,337 @@
+name: "multi-platform"
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+env:
+  TRIVY_VERSION: 0.69.3
+  TRIVY_DISABLE_VEX_NOTICE: "true"
+  TRIVY_DB_REPOSITORY: public.ecr.aws/aquasecurity/trivy-db,ghcr.io/aquasecurity/trivy-db
+  COPA_VERSION: 0.15.0
+  BUILDKIT_VERSION: v0.19.0
+  # multi-platform alpine index pinned by digest (linux/amd64, arm/v6, arm/v7, arm64/v8, 386, ppc64le, s390x)
+  SOURCE_IMAGE: docker.io/library/alpine@sha256:eece025e432126ce23f223450a0326fbebde39cdf496a85d8c016293fc851978
+  PATCHED_PLATFORMS: "linux/amd64 linux/arm64"
+  PRESERVED_ARCHES: "386 ppc64le s390x"
+permissions:
+  contents: read
+jobs:
+  # patch the platforms that have a report in a report directory and push the index,
+  # using buildkit in a container on the host network so it can reach localhost:5000
+  push-report-dir:
+    name: push (report directory)
+    runs-on: ubuntu-latest
+    services:
+      registry:
+        image: registry:2
+        ports:
+          - 5000:5000
+    steps:
+      - name: Check out code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+
+      - name: Install Trivy
+        run: |
+          curl --retry 5 -fsSL -o trivy.tar.gz "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+          tar -zxf trivy.tar.gz trivy
+          sudo mv trivy /usr/local/bin/
+          rm trivy.tar.gz
+
+      - name: Copy the test image to the local registry
+        run: skopeo copy --all --dest-tls-verify=false "docker://${SOURCE_IMAGE}" docker://localhost:5000/alpine:3.18.4
+
+      - name: Generate per-platform Trivy reports
+        run: ./test/scan-platforms.sh localhost:5000/alpine:3.18.4 reports
+
+      - name: Run Copa action
+        id: copa
+        uses: ./
+        with:
+          image: localhost:5000/alpine:3.18.4
+          image-report: reports
+          patched-tag: 3.18.4-patched
+          push: "true"
+          copa-version: ${{ env.COPA_VERSION }}
+          buildkit-version: ${{ env.BUILDKIT_VERSION }}
+          timeout: 15m
+          output: vex.json
+
+      - name: Check the outputs
+        env:
+          PATCHED_IMAGE: ${{ steps.copa.outputs.patched-image }}
+        run: |
+          echo "patched-image: ${PATCHED_IMAGE}"
+          test "$PATCHED_IMAGE" = "localhost:5000/alpine:3.18.4-patched"
+          test -s vex.json
+
+      - name: Verify the patched index
+        run: ./test/verify-multi-platform.sh localhost:5000/alpine:3.18.4 localhost:5000/alpine:3.18.4-patched reports
+
+  # patch the platforms in the platform input, without a report, and push the index to
+  # a registry that requires authentication
+  push-platform-auth:
+    name: push (platform, authenticated registry)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+
+      - name: Install Trivy
+        run: |
+          curl --retry 5 -fsSL -o trivy.tar.gz "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+          tar -zxf trivy.tar.gz trivy
+          sudo mv trivy /usr/local/bin/
+          rm trivy.tar.gz
+
+      - name: Start a registry with htpasswd authentication
+        run: |
+          password=$(openssl rand -hex 16)
+          echo "::add-mask::${password}"
+          echo "REGISTRY_PASSWORD=${password}" >> "$GITHUB_ENV"
+          mkdir -p "${RUNNER_TEMP}/auth"
+          docker run --rm --entrypoint htpasswd httpd:2.4 -Bbn copa "$password" > "${RUNNER_TEMP}/auth/htpasswd"
+          docker run --detach --name registry -p 5000:5000 -v "${RUNNER_TEMP}/auth:/auth:ro" \
+            -e REGISTRY_AUTH=htpasswd -e REGISTRY_AUTH_HTPASSWD_REALM=test -e REGISTRY_AUTH_HTPASSWD_PATH=/auth/htpasswd \
+            registry:2
+          for i in $(seq 30); do
+            status=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:5000/v2/ || true)
+            [ "$status" = "401" ] && break
+            sleep 1
+          done
+          test "$status" = "401"
+
+      - name: Copy the test image to the registry
+        run: skopeo copy --all --dest-tls-verify=false --dest-creds "copa:${REGISTRY_PASSWORD}" "docker://${SOURCE_IMAGE}" docker://localhost:5000/alpine:3.18.4
+
+      - name: Generate per-platform Trivy reports
+        env:
+          TRIVY_USERNAME: copa
+          TRIVY_PASSWORD: ${{ env.REGISTRY_PASSWORD }}
+        run: ./test/scan-platforms.sh localhost:5000/alpine:3.18.4 reports
+
+      - name: Run Copa action without registry credentials
+        id: copa-no-auth
+        continue-on-error: true
+        uses: ./
+        env:
+          DOCKER_CONFIG: ${{ runner.temp }}/no-docker-config
+        with:
+          image: localhost:5000/alpine:3.18.4
+          platform: linux/amd64,linux/arm64
+          patched-tag: 3.18.4-patched
+          push: "true"
+          copa-version: ${{ env.COPA_VERSION }}
+          buildkit-version: ${{ env.BUILDKIT_VERSION }}
+          timeout: 15m
+
+      - name: Check that patching failed without credentials
+        run: |
+          test "${{ steps.copa-no-auth.outcome }}" = "failure"
+          # remove the containers of the failed run
+          docker rm -f copa-action buildkitd || true
+
+      - name: Log in to the registry
+        run: echo "$REGISTRY_PASSWORD" | docker login localhost:5000 --username copa --password-stdin
+
+      - name: Run Copa action
+        id: copa
+        uses: ./
+        with:
+          image: localhost:5000/alpine:3.18.4
+          platform: linux/amd64,linux/arm64
+          patched-tag: 3.18.4-patched
+          push: "true"
+          copa-version: ${{ env.COPA_VERSION }}
+          buildkit-version: ${{ env.BUILDKIT_VERSION }}
+          timeout: 15m
+
+      - name: Check the outputs
+        env:
+          PATCHED_IMAGE: ${{ steps.copa.outputs.patched-image }}
+        run: |
+          echo "patched-image: ${PATCHED_IMAGE}"
+          test "$PATCHED_IMAGE" = "localhost:5000/alpine:3.18.4-patched"
+
+      - name: Verify the patched index
+        env:
+          TRIVY_USERNAME: copa
+          TRIVY_PASSWORD: ${{ env.REGISTRY_PASSWORD }}
+        run: ./test/verify-multi-platform.sh localhost:5000/alpine:3.18.4 localhost:5000/alpine:3.18.4-patched reports
+
+  # patch the platforms in the platform input, without a report, through the default
+  # buildx connection and write the patched index to an OCI layout
+  oci-dir:
+    name: oci-dir (platform)
+    runs-on: ubuntu-latest
+    services:
+      registry:
+        image: registry:2
+        ports:
+          - 5000:5000
+    steps:
+      - name: Check out code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+
+      - name: Install Trivy
+        run: |
+          curl --retry 5 -fsSL -o trivy.tar.gz "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+          tar -zxf trivy.tar.gz trivy
+          sudo mv trivy /usr/local/bin/
+          rm trivy.tar.gz
+
+      - name: Generate per-platform Trivy reports
+        run: ./test/scan-platforms.sh "$SOURCE_IMAGE" reports
+
+      - name: Run Copa action
+        id: copa
+        uses: ./
+        with:
+          image: ${{ env.SOURCE_IMAGE }}
+          platform: linux/amd64,linux/arm64
+          patched-tag: 3.18.4-patched
+          oci-dir: patched-layout
+          copa-version: ${{ env.COPA_VERSION }}
+          timeout: 15m
+
+      - name: Check the outputs
+        env:
+          PATCHED_IMAGE: ${{ steps.copa.outputs.patched-image }}
+        run: |
+          echo "patched-image: ${PATCHED_IMAGE}"
+          test "$PATCHED_IMAGE" = "docker.io/library/alpine:3.18.4-patched"
+
+      - name: Check the OCI layout written by Copa
+        run: |
+          sudo chown -R "$(id -u):$(id -g)" patched-layout
+          test -f patched-layout/oci-layout
+          jq . patched-layout/index.json
+
+          # Copa v0.15 writes the patched index itself as index.json; a layout with a
+          # single top-level index is accepted too
+          index=patched-layout/index.json
+          if [ "$(jq '.manifests | length' "$index")" -eq 1 ] && \
+             [ "$(jq -r '.manifests[0].mediaType' "$index")" = "application/vnd.oci.image.index.v1+json" ]; then
+            index="patched-layout/blobs/sha256/$(jq -r '.manifests[0].digest' "$index" | cut -d: -f2)"
+          fi
+
+          docker buildx imagetools inspect --raw "$SOURCE_IMAGE" > original-index.json
+          platforms() {
+            jq -r '.manifests[] | select(.platform.os != "unknown") | "\(.platform.os)/\(.platform.architecture)\(if .platform.variant and .platform.variant != "v8" then "/" + .platform.variant else "" end)"' "$1" | sort
+          }
+          digest_for() {
+            jq -r --arg arch "$2" '.manifests[] | select(.platform.os == "linux" and .platform.architecture == $arch) | .digest' "$1"
+          }
+          diff <(platforms original-index.json) <(platforms "$index")
+          for platform in $PATCHED_PLATFORMS; do
+            arch=$(echo "$platform" | cut -d'/' -f2)
+            digest=$(digest_for "$index" "$arch")
+            echo "${platform}: $(digest_for original-index.json "$arch") -> ${digest}"
+            test -n "$digest"
+            test "$digest" != "$(digest_for original-index.json "$arch")"
+            test -f "patched-layout/blobs/sha256/${digest#sha256:}"
+          done
+          for arch in $PRESERVED_ARCHES; do
+            digest=$(digest_for "$index" "$arch")
+            test "$digest" = "$(digest_for original-index.json "$arch")"
+            test -f "patched-layout/blobs/sha256/${digest#sha256:}"
+          done
+
+      - name: Copy the OCI layout to the local registry
+        run: |
+          # wrap a flat layout in a top-level index so that skopeo sees a single image
+          if [ "$(jq '.manifests | length' patched-layout/index.json)" -gt 1 ]; then
+            digest=$(sha256sum patched-layout/index.json | cut -d' ' -f1)
+            size=$(stat -c %s patched-layout/index.json)
+            cp patched-layout/index.json "patched-layout/blobs/sha256/${digest}"
+            jq -n --arg d "sha256:${digest}" --argjson s "$size" '{schemaVersion: 2, mediaType: "application/vnd.oci.image.index.v1+json", manifests: [{mediaType: "application/vnd.oci.image.index.v1+json", digest: $d, size: $s}]}' > patched-layout/index.json
+          fi
+          skopeo copy --all --dest-tls-verify=false oci:patched-layout docker://localhost:5000/alpine:3.18.4-patched
+
+      - name: Verify the patched index
+        run: ./test/verify-multi-platform.sh "$SOURCE_IMAGE" localhost:5000/alpine:3.18.4-patched reports
+
+  # without push or oci-dir, copa only loads the patched platforms into docker
+  local-load:
+    name: no push or oci-dir (platform)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+
+      - name: Run Copa action
+        id: copa
+        uses: ./
+        with:
+          image: ${{ env.SOURCE_IMAGE }}
+          platform: linux/amd64,linux/arm64
+          patched-tag: 3.18.4-patched
+          # an empty push is treated as false
+          push: ""
+          copa-version: ${{ env.COPA_VERSION }}
+          timeout: 15m
+
+      - name: Check the outputs
+        env:
+          PATCHED_IMAGE: ${{ steps.copa.outputs.patched-image }}
+        run: |
+          echo "patched-image: '${PATCHED_IMAGE}'"
+          test -z "$PATCHED_IMAGE"
+          docker image inspect docker.io/library/alpine:3.18.4-patched-amd64 docker.io/library/alpine:3.18.4-patched-arm64 --format '{{.RepoTags}} {{.Architecture}}'
+
+  # invalid inputs fail before buildkit is started
+  invalid-inputs:
+    name: invalid inputs (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: push and oci-dir
+            push: "true"
+            oci-dir: patched-layout
+          - name: push not a boolean
+            push: "yes"
+          - name: copa-version too old for platform
+            push: "false"
+            platform: linux/amd64
+            copa-version: 0.10.0
+          - name: copa-version too old for oci-dir
+            push: "false"
+            oci-dir: patched-layout
+            copa-version: 0.11.1
+    steps:
+      - name: Check out code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Run Copa action
+        id: copa
+        continue-on-error: true
+        uses: ./
+        with:
+          image: ${{ env.SOURCE_IMAGE }}
+          patched-tag: patched
+          push: ${{ matrix.push }}
+          oci-dir: ${{ matrix.oci-dir }}
+          platform: ${{ matrix.platform }}
+          copa-version: ${{ matrix.copa-version }}
+          buildkit-version: ${{ env.BUILDKIT_VERSION }}
+
+      - name: Check that the action failed before starting buildkit
+        run: |
+          test "${{ steps.copa.outcome }}" = "failure"
+          docker ps -a
+          test -z "$(docker ps -aq --filter name=buildkitd --filter name=copa-action)"
+          test ! -e patched-layout

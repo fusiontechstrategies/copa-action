@@ -5,7 +5,10 @@ SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 # Get copa_version arg
 ARG copa_version
 
-# Copies your code file from your action repository to the filesystem path `/` of the container
+# Copies your code file from your action repository to the filesystem path `/` of the container.
+# The copacetic release workflow builds and publishes this image for each copa release, but
+# action.yaml mounts the action's own entrypoint.sh over it at run time (see the comment there),
+# so entrypoint.sh must keep working with images that were published for older copa releases.
 COPY entrypoint.sh /entrypoint.sh
 
 # Install required packages

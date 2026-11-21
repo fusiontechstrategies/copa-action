@@ -8,10 +8,10 @@ inputs:
     description: 'The image reference to patch'
     required: true
   image-report:
-    description: 'The trivy json report of the image to patch'
-    required: true
+    description: 'The trivy json report of the image to patch, or a directory of per-platform reports for a multi-platform image (copa v0.11.0 and later). Leave empty to update all packages (copa v0.7.0 and later)'
+    required: false
   patched-tag:
-    description: 'The new patched image tag'
+    description: 'The new patched image tag, or a full image reference such as ghcr.io/org/app:1.0-patched (copa v0.12.0 and later)'
     required: true
   timeout:
     description: 'The timeout for the copa action'
@@ -31,13 +31,117 @@ inputs:
     description: "Max retries on timeout error"
     required: false
     default: 0
+  platform:
+    description: "Comma-separated list of platforms to patch in a multi-platform image, e.g. linux/amd64,linux/arm64 (copa v0.11.0 and later)"
+    required: false
+  push:
+    description: "Push the patched image, or the patched multi-platform index, to its registry (copa v0.11.0 and later)"
+    required: false
+    default: 'false'
+  oci-dir:
+    description: "Directory, relative to the workspace, to write the patched multi-platform index to as an OCI layout. Cannot be used with push (copa v0.12.0 and later)"
+    required: false
 outputs:
   patched-image:
-    description: 'Image reference of patched image'
+    description: 'Image reference of the patched image, or of the patched multi-platform index with push or oci-dir. Empty when a multi-platform image was patched without push or oci-dir'
     value: ${{ steps.copa-action.outputs.patched-image }}
 runs:
   using: "composite"
   steps:
+    # validate inputs before starting buildkit or pulling the copa-action image
+    - name: Validate inputs
+      shell: bash
+      env:
+        COPA_VERSION: ${{ inputs.copa-version }}
+        COPA_IMAGE_REPORT: ${{ inputs.image-report }}
+        COPA_PATCHED_TAG: ${{ inputs.patched-tag }}
+        COPA_PLATFORM: ${{ inputs.platform }}
+        COPA_PUSH: ${{ inputs.push }}
+        COPA_OCI_DIR: ${{ inputs.oci-dir }}
+      run: |
+        fail() {
+          echo "::error::$1"
+          exit 1
+        }
+
+        # an empty push means false
+        COPA_PUSH="${COPA_PUSH:-false}"
+        if [ "$COPA_PUSH" != "true" ] && [ "$COPA_PUSH" != "false" ]; then
+          fail "Invalid value for push: '$COPA_PUSH'. Use 'true' or 'false'."
+        fi
+        if [ "$COPA_PUSH" = "true" ] && [ -n "$COPA_OCI_DIR" ]; then
+          fail "The push and oci-dir inputs cannot be used together. Use push to push the patched image to a registry, or oci-dir to write it to an OCI layout."
+        fi
+
+        # check that the requested copa version supports the inputs in use;
+        # without copa-version, the latest copa release is used
+        if [ -n "$COPA_VERSION" ]; then
+          version="${COPA_VERSION#v}"
+          require() {
+            if [ "$(printf '%s\n%s\n' "$version" "$2" | sort -V | head -n1)" != "$2" ]; then
+              fail "$1 requires copa v$2 or later, but copa-version is $version."
+            fi
+          }
+          if [ -z "$COPA_IMAGE_REPORT" ]; then
+            require "Patching without image-report" 0.7.0
+          elif [ -d "$COPA_IMAGE_REPORT" ]; then
+            require "An image-report directory" 0.11.0
+          fi
+          if [ -n "$COPA_PLATFORM" ]; then
+            require "The platform input" 0.11.0
+          fi
+          if [ "$COPA_PUSH" = "true" ]; then
+            require "The push input" 0.11.0
+          fi
+          if [ -n "$COPA_OCI_DIR" ]; then
+            require "The oci-dir input" 0.12.0
+          fi
+          if [[ "$COPA_PATCHED_TAG" == *:* ]] || [[ "$COPA_PATCHED_TAG" == *@* ]]; then
+            require "A full image reference in patched-tag" 0.12.0
+          fi
+        fi
+
+        # pushing uses the registry credentials from docker login, see the docker run step
+        if [ "$COPA_PUSH" = "true" ]; then
+          docker_config="${DOCKER_CONFIG:-$HOME/.docker}/config.json"
+          if [ ! -f "$docker_config" ]; then
+            echo "::warning::push is set, but $docker_config does not exist. Log in to the registry, for example with docker/login-action, before running the Copacetic action."
+          elif jq -e '(.credsStore // "") != "" or ((.credHelpers // {}) | length > 0)' "$docker_config" > /dev/null 2>&1; then
+            echo "::warning::$docker_config uses a credential helper (credsStore or credHelpers). Credential helpers are not available inside the Copacetic action container, so only credentials stored in the auths section can be used to push."
+          fi
+        fi
+
+    # patching a non-native platform needs QEMU; copa reports its own error if it is
+    # missing, so this check only warns
+    - name: Check QEMU emulation
+      if: inputs.platform != ''
+      shell: bash
+      env:
+        COPA_PLATFORM: ${{ inputs.platform }}
+      run: |
+        binfmt_dir="/proc/sys/fs/binfmt_misc"
+        host_arch=$(uname -m)
+        IFS=',' read -ra platforms <<< "$COPA_PLATFORM"
+        for p in "${platforms[@]}"; do
+          p="${p//[[:space:]]/}"
+          [ -z "$p" ] && continue
+          arch=$(echo "$p" | cut -d'/' -f2)
+          case "$arch" in
+            amd64) qemu_arch="x86_64" ;;
+            arm64) qemu_arch="aarch64" ;;
+            arm) qemu_arch="arm" ;;
+            386) qemu_arch="i386" ;;
+            *) qemu_arch="$arch" ;;
+          esac
+          # platforms the runner runs natively
+          case "$host_arch:$qemu_arch" in
+            x86_64:i386 | aarch64:arm | "$host_arch:$host_arch") continue ;;
+          esac
+          if [ ! -e "$binfmt_dir/status" ] || ! compgen -G "$binfmt_dir/*$qemu_arch*" > /dev/null; then
+            echo "::warning::QEMU emulation for $p does not appear to be set up on this $host_arch runner. Add a docker/setup-qemu-action step before the Copacetic action. If emulation is missing, Copa fails to patch $p with its own error."
+          fi
+        done
+
     - name: Docker run copa-action
       id: copa-action
       shell: bash
@@ -49,6 +153,9 @@ runs:
         COPA_FORMAT: ${{ inputs.format }}
         COPA_OUTPUT: ${{ inputs.output }}
         COPA_MAX_RETRIES: ${{ inputs.max_retries }}
+        COPA_PLATFORM: ${{ inputs.platform }}
+        COPA_PUSH: ${{ inputs.push }}
+        COPA_OCI_DIR: ${{ inputs.oci-dir }}
       # copa-version, custom-socket and buildkit-version are still interpolated into the
       # script, so that shell variables in them keep working, such as the documented
       # `custom-socket: $SOCKET`
@@ -74,6 +181,24 @@ runs:
           connection="buildkit-container"
         fi
 
+        # Run the entrypoint.sh of this version of the action instead of the one in the
+        # image. The image is built and published by the copacetic release workflow from
+        # this repository's main branch, so its entrypoint is frozen at the copa release
+        # it was built for. Mounting it here makes new inputs work with every published
+        # copa-version, so entrypoint.sh must stay compatible with old images.
+        run_args=(
+          --mount "type=bind,source=$GITHUB_ACTION_PATH/entrypoint.sh,target=/copa-action/entrypoint.sh,readonly"
+          --entrypoint /bin/bash
+          -e COPA_PLATFORM -e COPA_PUSH -e COPA_OCI_DIR
+        )
+
+        # pushing needs the registry credentials from docker login; every credential in
+        # this file becomes readable inside the copa-action container
+        docker_config="${DOCKER_CONFIG:-$HOME/.docker}/config.json"
+        if [ "$COPA_PUSH" = "true" ] && [ -f "$docker_config" ]; then
+          run_args+=(--mount "type=bind,source=$docker_config,target=/root/.docker/config.json,readonly")
+        fi
+
         # run copa-action based on inputs; every argument is quoted, so an empty input
         # keeps its position instead of shifting the arguments after it
-        docker run --net=host --mount=type=bind,source="$(pwd)",target=/data --mount=type=bind,source="$socket",target="/var/run/docker.sock" --mount=type=bind,source="$GITHUB_OUTPUT",target="$GITHUB_OUTPUT" -e GITHUB_OUTPUT --name=copa-action "ghcr.io/project-copacetic/copa-action:v$version" "$COPA_IMAGE" "$COPA_IMAGE_REPORT" "$COPA_PATCHED_TAG" "$COPA_TIMEOUT" "$connection" "$COPA_FORMAT" "$COPA_OUTPUT" "$COPA_MAX_RETRIES"
+        docker run --net=host --mount=type=bind,source="$(pwd)",target=/data --mount=type=bind,source="$socket",target="/var/run/docker.sock" --mount=type=bind,source="$GITHUB_OUTPUT",target="$GITHUB_OUTPUT" -e GITHUB_OUTPUT "${run_args[@]}" --name=copa-action "ghcr.io/project-copacetic/copa-action:v$version" /copa-action/entrypoint.sh "$COPA_IMAGE" "$COPA_IMAGE_REPORT" "$COPA_PATCHED_TAG" "$COPA_TIMEOUT" "$connection" "$COPA_FORMAT" "$COPA_OUTPUT" "$COPA_MAX_RETRIES"
