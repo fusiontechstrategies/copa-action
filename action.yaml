@@ -41,6 +41,17 @@ runs:
     - name: Docker run copa-action
       id: copa-action
       shell: bash
+      env:
+        COPA_IMAGE: ${{ inputs.image }}
+        COPA_IMAGE_REPORT: ${{ inputs.image-report }}
+        COPA_PATCHED_TAG: ${{ inputs.patched-tag }}
+        COPA_TIMEOUT: ${{ inputs.timeout }}
+        COPA_FORMAT: ${{ inputs.format }}
+        COPA_OUTPUT: ${{ inputs.output }}
+        COPA_MAX_RETRIES: ${{ inputs.max_retries }}
+      # copa-version, custom-socket and buildkit-version are still interpolated into the
+      # script, so that shell variables in them keep working, such as the documented
+      # `custom-socket: $SOCKET`
       run : |
         # check for copa version input, else use latest
         if [ -z "${{ inputs.copa-version }}" ]; then
@@ -63,5 +74,6 @@ runs:
           connection="buildkit-container"
         fi
 
-        # run copa-action based on inputs
-        docker run --net=host --mount=type=bind,source=$(pwd),target=/data --mount=type=bind,source="$socket",target="/var/run/docker.sock" --mount=type=bind,source=$GITHUB_OUTPUT,target=$GITHUB_OUTPUT -e GITHUB_OUTPUT --name=copa-action "ghcr.io/project-copacetic/copa-action:v$version" ${{ inputs.image }} ${{ inputs.image-report }} ${{ inputs.patched-tag }} ${{ inputs.timeout }} ${connection} ${{ inputs.format }} ${{ inputs.output }} ${{ inputs.max_retries }}
+        # run copa-action based on inputs; every argument is quoted, so an empty input
+        # keeps its position instead of shifting the arguments after it
+        docker run --net=host --mount=type=bind,source="$(pwd)",target=/data --mount=type=bind,source="$socket",target="/var/run/docker.sock" --mount=type=bind,source="$GITHUB_OUTPUT",target="$GITHUB_OUTPUT" -e GITHUB_OUTPUT --name=copa-action "ghcr.io/project-copacetic/copa-action:v$version" "$COPA_IMAGE" "$COPA_IMAGE_REPORT" "$COPA_PATCHED_TAG" "$COPA_TIMEOUT" "$connection" "$COPA_FORMAT" "$COPA_OUTPUT" "$COPA_MAX_RETRIES"

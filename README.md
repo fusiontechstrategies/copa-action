@@ -72,6 +72,11 @@ To connect via buildkit in a container, provide the input `buildkit-version`. Co
 
 Refer to [Copacetic documentation](https://project-copacetic.github.io/copacetic/website/custom-address) to learn more about connecting Copa to Buildkit.
 
+## Behaviour changes
+
+- Inputs are passed to the action's script through environment variables instead of being written into it, so shell variables such as `$VAR` in `image`, `image-report`, `patched-tag`, `timeout`, `format`, `output` and `max_retries` are no longer expanded. Use `${{ env.VAR }}` instead. `copa-version`, `custom-socket` and `buildkit-version` are unchanged, so `custom-socket: $SOCKET` still works.
+- An empty `output` no longer shifts `max_retries` into its place. Before, the VEX document was written to a file named after `max_retries` (`0` by default) and retries were ignored.
+
 ## Example usage
 
 https://github.com/project-copacetic/copa-action/blob/00f0ef529529d7a7d49a1f3b9f5f5cf54ba2235e/.github/workflows/patch.yaml#L1-L81

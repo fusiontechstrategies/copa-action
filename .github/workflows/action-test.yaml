@@ -1,0 +1,64 @@
+name: "action"
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+env:
+  TRIVY_VERSION: 0.69.3
+  TRIVY_DISABLE_VEX_NOTICE: "true"
+  TRIVY_DB_REPOSITORY: public.ecr.aws/aquasecurity/trivy-db,ghcr.io/aquasecurity/trivy-db
+  TEST_IMAGE: docker.io/library/alpine:3.18.4
+permissions:
+  contents: read
+jobs:
+  single-platform:
+    name: single-platform (output ${{ matrix.output || 'unset' }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        output: ["", "vex.json"]
+    steps:
+      - name: Check out code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Trivy
+        run: |
+          curl --retry 5 -fsSL -o trivy.tar.gz "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+          tar -zxf trivy.tar.gz trivy
+          sudo mv trivy /usr/local/bin/
+          rm trivy.tar.gz
+
+      - name: Generate Trivy report
+        run: |
+          trivy image --image-src remote --pkg-types os --ignore-unfixed --scanners vuln -f json -o report.json "$TEST_IMAGE"
+
+      - name: Run Copa action
+        id: copa
+        uses: ./
+        with:
+          image: ${{ env.TEST_IMAGE }}
+          image-report: report.json
+          patched-tag: patched
+          output: ${{ matrix.output }}
+          max_retries: 2
+
+      - name: Check the patched image
+        env:
+          PATCHED_IMAGE: ${{ steps.copa.outputs.patched-image }}
+          OUTPUT: ${{ matrix.output }}
+        run: |
+          echo "patched-image: ${PATCHED_IMAGE}"
+          test "$PATCHED_IMAGE" = "docker.io/library/alpine:patched"
+          docker image inspect "$PATCHED_IMAGE" > /dev/null
+          if [ -n "$OUTPUT" ]; then
+            test -s "$OUTPUT"
+          fi
+          # an empty output used to shift max_retries into the output argument,
+          # which wrote the VEX document to a file named after max_retries
+          test ! -e 2
+          trivy image --image-src docker --pkg-types os --ignore-unfixed --scanners vuln -f json -o patched.json "$PATCHED_IMAGE"
+          after=$(jq '[.Results[]? | .Vulnerabilities[]?] | length' patched.json)
+          echo "fixable vulnerabilities after patching: ${after}"
+          test "$after" -eq 0
